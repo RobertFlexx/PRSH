@@ -1,0 +1,719 @@
+#!/usr/bin/env perl
+BEGIN {
+    $^W = 0;
+    $SIG{__WARN__} = sub {
+        my $w = shift // '';
+        return if $w =~ /_FORTIFY_SOURCE requires compiling with optimization/;
+        return if $w =~ /Statement unlikely to be reached/;
+        return if $w =~ /Maybe you meant system\(\) when you said exec\(\)/;
+        warn $w;
+    };
+    $| = 1;
+}
+
+use strict;
+use warnings;
+use feature 'say';
+use feature 'state';
+use POSIX qw(strftime setsid dup2);
+use Term::ReadLine;
+use Socket;
+use File::Spec;
+use Cwd ();
+use Sys::Hostname qw(hostname);
+use Time::HiRes qw(sleep);
+use Text::ParseWords;
+use Term::ReadKey;
+use IO::Select;
+
+# ---------------- version / env ----------------
+my $PRSH_VERSION = "BETA";
+$0 = "prsh-$PRSH_VERSION";
+$ENV{SHELL} = "prsh-$PRSH_VERSION";
+print "\033]0;prsh-$PRSH_VERSION\007";
+
+# ---------------- add GitHub link (as older versions had) ----------------
+my $GITHUB = "https://github.com/RobertFlexx";
+
+# ---------------- globals / history / term detection ----------------
+sub home_dir {
+    return $ENV{HOME} if defined $ENV{HOME} && $ENV{HOME} ne '';
+    my $home = (getpwuid($<))[7];
+    return $home if defined $home && $home ne '';
+    return '.';
+}
+my $HISTORY_FILE = File::Spec->catfile(home_dir(), ".prsh_history");
+my $CONFIG_FILE  = File::Spec->catfile(home_dir(), ".prshrc");
+my %aliases;
+my @child_pids = ();
+my @own_history = ();
+
+my %config = ();
+sub load_config {
+    %config = ();
+    return unless -f $CONFIG_FILE;
+    if (open my $cf, '<:encoding(UTF-8)', $CONFIG_FILE) {
+        while (<$cf>) {
+            chomp;
+            next unless /\S/;
+            next if /^\s*#/;
+            if (/^\s*([^=]+?)\s*=\s*(.*?)\s*$/) {
+                $config{$1} = $2;
+            }
+        }
+        close $cf;
+    }
+}
+sub write_config {
+    if (open my $cf, '>:encoding(UTF-8)', $CONFIG_FILE) {
+        for my $k (sort keys %config) {
+            print $cf "$k=$config{$k}\n";
+        }
+        close $cf;
+    }
+}
+load_config();
+$config{hide_readline_hint} = 0 unless defined $config{hide_readline_hint};
+
+my $term = Term::ReadLine->new('prsh');
+my $OUT = $term->OUT || *STDOUT;
+my $has_addhistory = eval { $term->can('addhistory') } || 0;
+my $has_get_history = eval { $term->can('get_history') } || 0;
+
+my $interrupted = 0;
+
+$SIG{INT} = sub {
+    if (@child_pids) {
+        for my $pgid (@child_pids) {
+            kill 'INT', -$pgid;
+        }
+    } else {
+        $interrupted = 1;
+    }
+};
+
+# ---------------- history load/save ----------------
+if (-f $HISTORY_FILE) {
+    if (open my $hf, '<:encoding(UTF-8)', $HISTORY_FILE) {
+        chomp(my @history = <$hf>);
+        close $hf;
+        @own_history = @history if @history;
+        if ($has_addhistory) {
+            eval { $term->addhistory($_) for @history };
+        }
+    }
+}
+END {
+    eval {
+        if ($has_get_history) {
+            my $h_ref = eval { $term->get_history };
+            if ($h_ref && ref($h_ref) eq 'ARRAY') {
+                if (open my $hf, '>:encoding(UTF-8)', $HISTORY_FILE) {
+                    for my $entry (@$h_ref) {
+                        next unless defined $entry && $entry =~ /\S/;
+                        print $hf $entry, "\n";
+                    }
+                    close $hf;
+                }
+                return;
+            }
+        }
+        if (@own_history) {
+            if (open my $hf, '>:encoding(UTF-8)', $HISTORY_FILE) {
+                for my $entry (@own_history) {
+                    next unless defined $entry && $entry =~ /\S/;
+                    print $hf $entry, "\n";
+                }
+                close $hf;
+            }
+        }
+    };
+}
+
+# ---------------- utilities ----------------
+sub color { my ($t,$c)=@_; return "\e[$c"."m$t\e[0m"; }
+sub random_color { my @c=(31,32,33,34,35,36,37); return $c[int(rand(@c))]; }
+sub rainbow_codes { return (31,33,32,36,34,35,91,93,92,96,94,95) }
+sub expand_vars { my ($s)=@_; $s =~ s/\$([a-zA-Z_][a-zA-Z0-9_]*)/(exists $ENV{$1} ? $ENV{$1} : "")/ge; return $s; }
+sub shell_split { my ($cmd)=@_; return () unless defined $cmd && $cmd =~ /\S/; return shellwords($cmd); }
+sub human_bytes {
+    my ($b)=@_;
+    return "0 B" unless defined $b && $b>0;
+    my @u = qw(B KB MB GB TB);
+    my $i = 0;
+    my $s = $b + 0.0;
+    while ($s > 1024 && $i < $#u) { $s /= 1024; $i++ }
+    return sprintf("%.2f %s", $s, $u[$i]);
+}
+sub nice_bar {
+    my ($pct,$w,$code)=@_; $w ||= 30; $code ||= 32;
+    $pct = 0 unless defined $pct; $pct = 0 if $pct < 0; $pct = 100 if $pct > 100;
+    my $filled = int(($pct/100) * $w + 0.5);
+    my $bar = ("█" x $filled) . ("░" x ($w - $filled));
+    return color("[$bar]", $code) . " " . color(sprintf("%3d%%", $pct), 37);
+}
+
+# ---------------- completion helpers (used by fallback editor) ----------------
+sub _collect_completions {
+    my ($text) = @_;
+    $text //= '';
+    my @matches;
+
+    if ($text =~ /\//) {
+        my ($dir,$prefix) = $text =~ m{^(.*/)?([^/]*)$};
+        $dir //= './';
+        my $pattern = $dir . ($prefix // '') . '*';
+        for my $p (glob($pattern)) {
+            push @matches, $p;
+        }
+    } else {
+        for my $p (glob("$text*")) {
+            push @matches, $p;
+        }
+        for my $d (split /:/, $ENV{PATH} // '') {
+            next unless -d $d;
+            if (opendir my $dh, $d) {
+                while (my $f = readdir $dh) {
+                    next unless $f =~ /^\Q$text\E/;
+                    my $full = File::Spec->catfile($d, $f);
+                    if (-x $full) {
+                        push @matches, $f;
+                    }
+                }
+                closedir $dh;
+            }
+        }
+    }
+
+    my %seen;
+    @matches = grep { !$seen{$_}++ } sort @matches;
+    return @matches;
+}
+
+# ---------------- aliases ----------------
+sub expand_aliases {
+    my ($cmd,$seen)=@_; $seen ||= {};
+    return $cmd unless defined $cmd && $cmd =~ /\S/;
+    my ($first,$rest) = $cmd =~ /^\s*(\S+)(?:\s+(.*))?$/;
+    return $cmd unless defined $first;
+    return $cmd if $seen->{$first}++;
+    if (exists $aliases{$first}) {
+        my $replacement = $aliases{$first};
+        my $expanded = expand_aliases($replacement,$seen);
+        return defined $rest ? "$expanded $rest" : $expanded;
+    }
+    return $cmd;
+}
+
+# ---------------- system info / quotes / helpers ----------------
+sub current_time { return strftime("%Y-%m-%d %H:%M:%S %Z", localtime) }
+sub detect_distro {
+    if (-f '/etc/os-release') {
+        if (open my $fh,'<','/etc/os-release') {
+            while (<$fh>) { chomp; if (/^PRETTY_NAME=(.*)$/) { my $v=$1; $v=~s/^"//; $v=~s/"$//; close $fh; return $v } }
+            close $fh;
+        }
+    }
+    return $^O;
+}
+my @QUOTES = (
+    "Keep calm and code on.","Did you try turning it off and on again?","There's no place like 127.0.0.1.",
+    "To iterate is human, to recurse divine.","sudo rm -rf / - Just kidding, don't do that!","The shell is mightier than the sword.",
+    "A journey of a thousand commits begins with a single push.","In case of fire: git commit, git push, leave building.",
+    "Debugging is like being the detective in a crime movie where you are also the murderer.",
+    "Unix is user-friendly. It's just selective about who its friends are.","Old sysadmins never die, they just become daemons.",
+    "Listen you flatpaker! - Totally Terry Davis","Life is short, but your command history is eternal.",
+    "If at first you don't succeed, git commit and push anyway.","rm -rf: the ultimate trust exercise.",
+    "Coding is like magic, but with more coffee.","There's no bug, only undocumented features.",
+    "Keep your friends close and your aliases closer.","When in doubt, make it a function.",
+    "Some call it procrastination, we call debugging curiosity.","Your mom called, she wants her semicolons back.",
+);
+my $current_quote = $QUOTES[ int(rand(@QUOTES)) ];
+sub dynamic_quote { my @chars = split //, $current_quote; my @rain = rainbow_codes(); my $i=0; return join "", map { color($_, $rain[$i++ % @rain]) } @chars; }
+
+# ---------------- CPU / RAM / storage helpers (kept concise) ----------------
+sub read_cpu_times { return () unless -f '/proc/stat'; open my $fh,'<','/proc/stat' or return (); while (<$fh>) { if (/^cpu\s+(.*)/) { close $fh; my @v = map { int($_) } split /\s+/, $1; return @v } } close $fh; return (); }
+sub calculate_cpu_usage {
+    my (@prev)=@{$_[0]}; my (@cur)=@{$_[1]}; return 0 unless @prev && @cur;
+    my $prev_idle = ($prev[3]||0)+($prev[4]||0);
+    my $idle = ($cur[3]||0)+($cur[4]||0);
+    my $prev_non = ($prev[0]||0)+($prev[1]||0)+($prev[2]||0)+($prev[5]||0)+($prev[6]||0)+($prev[7]||0);
+    my $non = ($cur[0]||0)+($cur[1]||0)+($cur[2]||0)+($cur[5]||0)+($cur[6]||0)+($cur[7]||0);
+    my $prev_total = $prev_idle + $prev_non; my $total = $idle + $non;
+    my $totald = $total - $prev_total; my $idled = $idle - $prev_idle;
+    return 0 if $totald <= 0; return (($totald - $idled) / $totald) * 100;
+}
+sub cpu_info { if (-f '/proc/stat' && -f '/proc/cpuinfo') { my @p1 = read_cpu_times; sleep 0.05; my @p2 = read_cpu_times; my $usage = sprintf("%.1f", calculate_cpu_usage(\@p1,\@p2)); my $cores=0; my @freqs; open my $fh,'<','/proc/cpuinfo'; while (<$fh>) { $cores++ if /^processor\s*:\s*\d+/; push @freqs, sprintf("%.0fMHz",$1) if /^cpu MHz\s*:\s*([\d.]+)/ } close $fh; my $freq_display = @freqs ? join(", ", @freqs[0..($cores-1)]) : "N/A"; return color("CPU Usage:",36)." ".color("$usage%",33)." | ".color("Cores:",36)." ".color($cores,32)." | ".color("Freqs:",36)." ".color($freq_display,35) } return color("CPU Usage:",36)." Info not available" }
+sub ram_info { if (-f '/proc/meminfo') { my %m; open my $fh,'<','/proc/meminfo'; while (<$fh>) { if (/^(\S+):\s+(\d+)/) { $m{$1} = $2 * 1024 } } close $fh; my $total = $m{MemTotal} || 0; my $avail = $m{MemAvailable} || $m{MemFree} || 0; my $used = $total - $avail; return color("RAM Usage:",36)." ".color(human_bytes($used),33)." / ".color(human_bytes($total),32) } return color("RAM Usage:",36)." Info not available" }
+sub storage_info { my $cwd = Cwd::getcwd(); my $out = qx(df -B1 "$cwd" 2>/dev/null); if ($? == 0 && $out =~ /\S/) { my @lines = split /\n/, $out; my $line = $lines[-1]; my @f = split /\s+/, $line; my ($total, $used) = ($f[1] // 0, $f[2] // 0); return color("Storage Usage ($cwd):",36)." ".color(human_bytes($used),33)." / ".color(human_bytes($total),32) } return color("Storage Usage:",36)." Info not available" }
+
+# ---------------- package counting ----------------
+sub which { for my $d (split /:/, $ENV{PATH}) { next unless defined $d && $d ne ''; my $f = File::Spec->catfile($d, $_[0]); return $f if -x $f } return undef }
+sub run_and_count_lines { my ($cmd)=@_; my $out = qx($cmd 2>/dev/null); return 0 unless defined $out && $out ne ''; return scalar split /\n/,$out }
+sub detect_pkg_manager_and_count {
+    if (which('dpkg-query')) { my $c=0; my $fmt="'\\\${Status} \\\${Package}\\n'"; if (open my $fh,'-|',"dpkg-query -W -f=$fmt 2>/dev/null"){ while(<$fh>){ $c++ if /^install ok installed/ } close $fh; return ('dpkg',$c,"dpkg (Debian/Ubuntu)"); } else { return ('dpkg',0,"dpkg (Debian/Ubuntu)"); } }
+    if (which('rpm')) { my $c = run_and_count_lines('rpm -qa'); return ('rpm',$c,"rpm (RHEL/Fedora/openSUSE)"); }
+    if (which('pacman')) { my $c = run_and_count_lines('pacman -Q'); return ('pacman',$c,"pacman (Arch)"); }
+    if (which('apk')) { my $c = run_and_count_lines('apk info'); return ('apk',$c,"apk (Alpine)"); }
+    if (which('pkg')) { my $c = run_and_count_lines('pkg info'); return ('pkg',$c,"pkg (FreeBSD)"); }
+    if (which('flatpak')) { my $c = run_and_count_lines('flatpak list --app'); return ('flatpak',$c,"flatpak (flatpak apps)"); }
+    if (which('snap')) { my $c = run_and_count_lines('snap list'); return ('snap',$c,"snap (snap packages)"); }
+    return ('unknown',0,"unknown");
+}
+
+# ---------------- builtins ----------------
+sub builtin_help {
+    say color('=' x 60, "1;35");
+    say color("prsh $PRSH_VERSION - Builtin Commands", "1;33");
+    printf "%s\n", color(sprintf("%-18s%-42s", "Command","Description"), "1;36");
+    say color('-' x 60, "1;34");
+    printf "%s\n", color(sprintf("%-18s", "cd"), "1;36") . "Change directory";
+    printf "%s\n", color(sprintf("%-18s", "pwd"), "1;36") . "Print working directory";
+    printf "%s\n", color(sprintf("%-18s", "exit / quit"), "1;36") . "Exit the shell";
+    printf "%s\n", color(sprintf("%-18s", "alias"), "1;36") . "Create or list aliases";
+    printf "%s\n", color(sprintf("%-18s", "unalias"), "1;36") . "Remove alias";
+    printf "%s\n", color(sprintf("%-18s", "jobs"), "1;36") . "Show background jobs (tracked pids)";
+    printf "%s\n", color(sprintf("%-18s", "systemfetch"), "1;36") . "Display system information (includes package count)";
+    printf "%s\n", color(sprintf("%-18s", "uptime"), "1;36") . "Show system uptime";
+    printf "%s\n", color(sprintf("%-18s", "hist"), "1;36") . "Show shell history";
+    printf "%s\n", color(sprintf("%-18s", "clearhist"), "1;36") . "Clear saved history (memory + file)";
+    printf "%s\n", color(sprintf("%-18s", "togglehint"), "1;36") . "Toggle persistent readline hint on/off";
+    printf "%s\n", color(sprintf("%-18s", "help"), "1;36") . "Show this help message";
+    say color('=' x 60, "1;35");
+}
+
+sub builtin_systemfetch {
+    my $user = $ENV{USER} || getpwuid($<) || 'unknown';
+    my $host = hostname();
+    my $os = detect_distro();
+    my $perl_ver = $^V;
+    my @p1 = read_cpu_times(); sleep 0.05; my @p2 = read_cpu_times();
+    my $cpu_percent = 0; eval { $cpu_percent = sprintf("%.1f", calculate_cpu_usage(\@p1,\@p2)) }; $cpu_percent = 0 if $@;
+    my $mem_percent = 0;
+    if (-f '/proc/meminfo') {
+        my %m; open my $fh,'<','/proc/meminfo'; while (<$fh>) { if (/^(\S+):\s+(\d+)/) { $m{$1} = $2 * 1024 } } close $fh;
+        my $total = $m{MemTotal} || 1; my $avail = $m{MemAvailable} || $m{MemFree} || 0; my $used = $total - $avail;
+        $mem_percent = sprintf("%.1f", ($used/$total*100));
+    }
+    my ($pm,$count,$note) = detect_pkg_manager_and_count();
+    say color('=' x 60, "1;35");
+    say color("prsh System Information", "1;33");
+    say color("User:        ", "1;36") . color("$user\@$host", "0;37");
+    say color("OS:          ", "1;36") . color($os, "0;37");
+    say color("Shell:       ", "1;36") . color("prsh $PRSH_VERSION", "0;37");
+    say color("Perl:        ", "1;36") . color("$perl_ver", "0;37");
+    say color("CPU Usage:   ", "1;36") . nice_bar($cpu_percent, 30, 32);
+    say color("RAM Usage:   ", "1;36") . nice_bar($mem_percent, 30, 35);
+    if ($pm ne 'unknown') { say color("Packages:     ", "1;36") . color("$count", "0;37") . " " . color("($note)", "0;90"); }
+    else { say color("Packages:     ", "1;36") . color("Unknown package manager", "31") . " " . color("(tried dpkg/rpm/pacman/apk/pkg/flatpak/snap)", "90"); }
+    say color("Storage:      ", "1;36") . color(storage_info(), "0;37");
+    say color('=' x 60, "1;35");
+}
+
+sub builtin_jobs {
+    if (!@child_pids) { say color("No tracked child jobs.", 36); return; }
+    for my $pgid (@child_pids) {
+        my $status = (kill 0, $pgid) ? 'running' : 'done';
+        say "[$pgid] $status";
+    }
+}
+
+sub builtin_hist {
+    my $i = 0;
+    if ($has_get_history) {
+        my $h_ref = eval { $term->get_history };
+        if ($h_ref && ref($h_ref) eq 'ARRAY') { for my $h (@$h_ref) { printf "%5d  %s\n", ++$i, $h } return }
+    }
+    if (@own_history) { for my $h (@own_history) { printf "%5d  %s\n", ++$i, $h } return }
+    if (-f $HISTORY_FILE) { if (open my $hf,'<:encoding(UTF-8)',$HISTORY_FILE) { while (my $line = <$hf>) { chomp $line; printf "%5d  %s\n", ++$i, $line } close $hf; return } }
+}
+
+# ---------------- new builtin: clearhist ----------------
+sub builtin_clearhist {
+    @own_history = ();
+    if (-f $HISTORY_FILE) {
+        unlink $HISTORY_FILE or warn "Could not remove history file '$HISTORY_FILE': $!";
+    }
+    eval {
+        if ($term) {
+            if ($term->can('clear_history')) {
+                eval { $term->clear_history(); 1 };
+            }
+            my $attribs = eval { $term->Attribs };
+            if ($attribs && ref($attribs) eq 'HASH') {
+                $attribs->{history} = [] if exists $attribs->{history};
+            }
+        }
+    };
+    say color("History cleared (memory + file).", 32);
+}
+
+# ---------------- new builtin: togglehint (persistent) ----------------
+sub builtin_togglehint {
+    $config{hide_readline_hint} = $config{hide_readline_hint} ? 0 : 1;
+    write_config();
+    say color("Persistent readline hint is now " . ($config{hide_readline_hint} ? "OFF" : "ON") . ".", 36);
+}
+
+sub builtin_uptime {
+    if (-f '/proc/uptime') {
+        open my $fh,'<','/proc/uptime';
+        my $line = <$fh>;
+        close $fh;
+        if ($line =~ /^(\d+\.\d+)/) {
+            my $s = int($1); my $d = int($s/86400); $s %= 86400; my $h = int($s/3600); $s %= 3600; my $m = int($s/60);
+            say "Uptime: ${d} days, ${h} hours, ${m} minutes"; return;
+        }
+    }
+    my $out = qx(uptime 2>/dev/null);
+    say $out ? $out : "Uptime info not available";
+}
+
+# ---------------- PTY helpers & run_external ----------------
+use constant TIOCGWINSZ => eval { require 'sys/ioctl.ph'; &TIOCGWINSZ } || 0x5413;
+use constant TIOCSWINSZ => eval { require 'sys/ioctl.ph'; &TIOCSWINSZ } || 0x5414;
+
+sub set_winsize_for_pty {
+    my ($pty) = @_;
+    return unless $pty;
+    my $out_fd = fileno($OUT) // fileno(STDOUT);
+    my $buf = pack("S S S S", 0,0,0,0);
+    if (defined $out_fd && ioctl($out_fd, &TIOCGWINSZ, $buf)) {
+        my ($rows,$cols,$xp,$yp) = unpack("S S S S", $buf);
+        my $packed = pack("S S S S", $rows,$cols,$xp,$yp);
+        my $pty_fd = eval { $pty->fileno };
+        ioctl($pty_fd, &TIOCSWINSZ, $packed) if defined $pty_fd;
+    }
+}
+
+sub run_external {
+    my ($line,$stdin_file,$stdout_file,$append) = @_;
+    my @args = shell_split($line);
+    return unless @args;
+
+    if (defined $stdin_file || defined $stdout_file) {
+        return _run_external_fork_exec($line,$stdin_file,$stdout_file,$append);
+    }
+
+    my $have_pty = eval { require IO::Pty; IO::Pty->import(); 1 };
+    unless ($have_pty) { return _run_external_fork_exec($line,$stdin_file,$stdout_file,$append) }
+
+    my $pty = eval { IO::Pty->new() };
+    unless ($pty) { return _run_external_fork_exec($line,$stdin_file,$stdout_file,$append) }
+
+    my $pid = fork();
+    if (!defined $pid) { say color("Failed to fork",31); return }
+    if ($pid == 0) {
+        setsid();
+        my $slave = $pty->slave();
+        my $sfd = $slave->fileno;
+        POSIX::dup2($sfd, fileno(STDIN));
+        POSIX::dup2($sfd, fileno(STDOUT));
+        POSIX::dup2($sfd, fileno(STDERR));
+        $pty->close;
+        $SIG{INT} = 'DEFAULT';
+        CORE::exec $args[0], @args[1..$#args];
+        POSIX::_exit(127);
+    } else {
+        push @child_pids, $pid;
+        set_winsize_for_pty($pty);
+        local $SIG{WINCH} = sub { set_winsize_for_pty($pty) };
+        local $SIG{INT} = 'IGNORE';
+        Term::ReadKey::ReadMode('raw');
+        my $sel = IO::Select->new();
+        $sel->add($pty);
+        $sel->add(\*STDIN);
+        my $ok = 1;
+        eval {
+            while ($ok) {
+                my @ready = $sel->can_read(0.25);
+                for my $fh (@ready) {
+                    if ($fh == $pty) {
+                        my $buf = '';
+                        my $n = sysread($pty, $buf, 4096);
+                        if (!defined $n || $n == 0) { $ok = 0; last }
+                        print $buf;
+                    } else {
+                        my $in = '';
+                        my $n = sysread(STDIN, $in, 4096);
+                        if (!defined $n || $n == 0) { $ok = 0; last }
+                        syswrite($pty, $in);
+                    }
+                }
+            }
+        };
+        Term::ReadKey::ReadMode('restore');
+        waitpid($pid, 0);
+        my $exit = $? >> 8;
+        @child_pids = grep { $_ != $pid } @child_pids;
+        $pty->close if $pty;
+        if ($exit == 127) { say color("Command not found: $args[0]", random_color()) }
+    }
+}
+
+sub _run_external_fork_exec {
+    my ($line,$stdin_file,$stdout_file,$append) = @_;
+    my @args = shell_split($line);
+    return unless @args;
+    my $pid = fork();
+    if (!defined $pid) { say color("Failed to fork",31); return }
+    if ($pid == 0) {
+        $SIG{INT} = 'DEFAULT';
+        if (defined $stdin_file) { open STDIN,'<',$stdin_file or POSIX::_exit(1) }
+        if (defined $stdout_file) {
+            if ($append) { open STDOUT,'>>',$stdout_file or POSIX::_exit(1) }
+            else { open STDOUT,'>',$stdout_file or POSIX::_exit(1) }
+        }
+        if (open my $nullfh, '>', '/dev/null') { POSIX::dup2(fileno($nullfh), fileno(STDERR)); }
+        CORE::exec $args[0], @args[1..$#args];
+        POSIX::_exit(127);
+    } else {
+        push @child_pids, $pid;
+        waitpid($pid,0);
+        my $exit = $? >> 8;
+        @child_pids = grep { $_ != $pid } @child_pids;
+        if ($exit == 127) { say color("Command not found: $args[0]", random_color()) }
+    }
+}
+
+# ---------------- command dispatch ----------------
+sub parse_redirection {
+    my ($cmd) = @_;
+    my ($stdin_file,$stdout_file,$append) = (undef,undef,0);
+    if ($cmd =~ /(.*)>>\s*(\S+)\s*$/) { $cmd = $1; $stdout_file = $2; $append = 1 }
+    elsif ($cmd =~ /(.*)>\s*(\S+)\s*$/) { $cmd = $1; $stdout_file = $2 }
+    if ($cmd =~ /(.*)<\s*(\S+)\s*$/) { $cmd = $1; $stdin_file = $2 }
+    $cmd =~ s/\s+$//;
+    return ($cmd,$stdin_file,$stdout_file,$append);
+}
+
+sub run_command {
+    my ($cmd) = @_;
+    return unless defined $cmd;
+    $cmd =~ s/^\s+|\s+$//g; return if $cmd eq '';
+    $cmd = expand_aliases($cmd);
+    $cmd = expand_vars($cmd);
+    my ($core,$stdin,$stdout,$append) = parse_redirection($cmd);
+    my @args = shell_split($core);
+    return unless @args;
+
+    if ($args[0] eq 'cd') {
+        my $path = $args[1] // home_dir();
+        if (! -e $path) { say color("cd: no such file or directory: $path",31); return }
+        if (! -d $path) { say color("cd: not a directory: $path",31); return }
+        chdir $path or say color("cd: $!",31);
+        return;
+    }
+    if ($args[0] eq 'exit' || $args[0] eq 'quit') {
+        print color("Do you really wanna leave me? (y/n) ",35);
+        my $ans = <STDIN>;
+        if (defined $ans) { chomp $ans; if ($ans =~ /^(y|yes)$/i) { say color("Bye! Take care!",36); kill 'TERM', $_ for @child_pids; exit 0 } else { return } } else { exit 0 }
+    }
+    if ($args[0] eq 'alias') {
+        if (!defined $args[1]) { while (my ($k,$v) = each %aliases) { say "$k='$v'" } }
+        else { my $rest = join ' ', @args[1..$#args]; if ($rest =~ /^(\w+)=(['"]?)(.+?)\2$/) { $aliases{$1} = $3 } else { say color("Invalid alias format. Use: alias name='command'",31) } }
+        return;
+    }
+    if ($args[0] eq 'unalias') { if ($args[1]) { delete $aliases{$args[1]} } else { say color("unalias: usage: unalias name",31) } return }
+    if ($args[0] eq 'help') { builtin_help(); return }
+    if ($args[0] eq 'systemfetch') { builtin_systemfetch(); return }
+    if ($args[0] eq 'jobs') { builtin_jobs(); return }
+    if ($args[0] eq 'pwd') { say color(Cwd::getcwd(),36); return }
+    if ($args[0] eq 'hist') { builtin_hist(); return }
+    if ($args[0] eq 'clearhist') { builtin_clearhist(); return }
+    if ($args[0] eq 'togglehint') { builtin_togglehint(); return }
+    if ($args[0] eq 'uptime') { builtin_uptime(); return }
+    if ($args[0] =~ m{[/\\]} || $args[0] =~ /^\./) { if (-d $args[0]) { say color("prsh: $args[0]: is a directory",31); return } }
+
+    run_external($core,$stdin,$stdout,$append);
+}
+
+# ---------------- chained commands ----------------
+sub run_input_line {
+    my ($input) = @_;
+    my @parts = split /(?:&&|;)/, $input;
+    for my $p (@parts) { $p =~ s/^\s+|\s+$//g; next unless $p; run_command($p) }
+}
+
+# ---------------- prompt & readline helpers ----------------
+my $hostname = hostname();
+my $prompt_color = random_color();
+sub prompt { my $cwd = Cwd::getcwd(); return color($cwd,33) . " " . color($hostname,36) . color(' > ', $prompt_color) }
+
+sub running_under_rlwrap {
+    my $ppid = getppid();
+    return 0 unless $ppid;
+    my $proc = "/proc/$ppid/cmdline";
+    if (-r $proc) {
+        if (open my $fh,'<',$proc) { my $cmd = do { local $/; <$fh> }; close $fh; return 1 if defined $cmd && $cmd =~ /rlwrap/ }
+    }
+    return 0;
+}
+
+# ---------------- fallback readline ----------------
+sub my_readline {
+    my ($prompt_text) = @_;
+    my $under_rlwrap = running_under_rlwrap();
+
+    if (( $term && $term->can('readline') && ! (ref($term) =~ /Stub/) ) || $under_rlwrap) {
+        my $line;
+        eval {
+            local $SIG{INT} = sub { print "^C\n"; die "INT\n" };
+            $line = $term->readline($prompt_text);
+        };
+        if ($@) { return '' }
+        return $line;
+    }
+
+    print $prompt_text;
+    Term::ReadKey::ReadMode('cbreak');
+    my $line = "";
+    my $hist_index = scalar(@own_history);
+    my $redraw = sub { print "\r$prompt_text$line\x1b[K" };
+
+    my $sel = IO::Select->new();
+    $sel->add(\*STDIN);
+
+    while (1) {
+        if ($interrupted) {
+            $interrupted = 0;
+            Term::ReadKey::ReadMode('normal');
+            print "^C\n";
+            return '';
+        }
+
+        my @ready = $sel->can_read(0.08);
+        unless (@ready) { next }
+
+        my $key = ReadKey(-1);
+        defined $key or next;
+
+        if ($key eq "\x03") {
+            Term::ReadKey::ReadMode('normal');
+            print "^C\n";
+            return '';
+        }
+
+        if ($key eq "\t") {
+            my ($pre, $word) = ('', $line);
+            if ($line =~ /^(.*\s)(\S*)$/s) { $pre = $1; $word = $2; }
+            my @matches = _collect_completions($word);
+            if (!@matches) {
+            } elsif (@matches == 1) {
+                my $m = $matches[0];
+                my $suffix = substr($m, length($word));
+                if (-d $m && $m !~ m{/$}) { $suffix .= '/' unless $suffix =~ m{/$} }
+                $line = $pre . $word . $suffix;
+                if (!(-d $m)) { $line .= ' ' unless $line =~ /\s$/ }
+                $redraw->();
+            } else {
+                Term::ReadKey::ReadMode('normal');
+                print "\n";
+                for my $m (@matches) { print "$m\n" }
+                print "\n";
+                $redraw->();
+                Term::ReadKey::ReadMode('cbreak');
+            }
+            next;
+        }
+
+        if ($key eq "\n" || $key eq "\r") {
+            print "\n";
+            last;
+        }
+
+        if ($key eq "\x7f" || $key eq "\x08") {
+            if (length $line) {
+                substr($line, -1, 1, '');
+                $redraw->();
+            }
+            next;
+        }
+
+        if ($key eq "\e") {
+            my $b = ReadKey(-1);
+            if (defined $b && $b eq '[') {
+                my $c = ReadKey(-1);
+                if (defined $c) {
+                    if ($c eq 'A') {
+                        if ($hist_index > 0) {
+                            $hist_index--;
+                            $line = $own_history[$hist_index] // '';
+                            $redraw->();
+                        }
+                    } elsif ($c eq 'B') {
+                        if ($hist_index < @own_history - 1) {
+                            $hist_index++;
+                            $line = $own_history[$hist_index] // '';
+                        } else {
+                            $hist_index = @own_history;
+                            $line = '';
+                        }
+                        $redraw->();
+                    }
+                }
+            }
+            next;
+        }
+
+        if ($key =~ /^[\x20-\x7e]$/) {
+            $line .= $key;
+            print $key;
+            next;
+        }
+    }
+
+    Term::ReadKey::ReadMode('normal');
+    return $line;
+}
+
+# ---------------- completion (readline) ----------------
+if ($term->can('Attribs')) {
+    my $attribs = $term->Attribs;
+    eval {
+        $attribs->{completion_entry_function} = sub {
+            my ($text,$state) = @_;
+            state @matches = ();
+            if ($state == 0) {
+                @matches = _collect_completions($text);
+            }
+            return $matches[$state];
+        };
+    };
+}
+
+# ---------------- welcome ----------------
+sub print_welcome {
+    say color("Welcome to prsh $PRSH_VERSION - your Perl-ish shell!",36);
+    say color("Current Time:",36) . " " . color(current_time(),34);
+    say cpu_info();
+    say ram_info();
+    say storage_info();
+    say dynamic_quote();
+    say "";
+    if (! $config{hide_readline_hint}) {
+        if (ref($term) =~ /Stub/ && ! running_under_rlwrap()) {
+            say color("Note: Readline backend looks minimal; fallback editor active.", "1;33");
+            say color("Arrow-up/down populate history; install Term::ReadLine::Gnu or use 'rlwrap ./prsh' for full editing.", "0;37");
+            say "";
+        }
+    }
+    say color("Coded with ❤",90);
+    say color("GitHub: $GITHUB",90);
+    say "";
+}
+print_welcome();
+
+# ---------------- main loop ----------------
+while (1) {
+    print "\033]0;prsh-$PRSH_VERSION\007";
+    my $line = my_readline(prompt());
+    unless (defined $line) { say ""; last }
+    $line =~ s/^\s+|\s+$//g;
+    next if $line eq '';
+    push @own_history, $line unless @own_history && $own_history[-1] eq $line;
+    eval { $term->addhistory($line) } if $has_addhistory;
+    run_input_line($line);
+}
+
+exit 0;
