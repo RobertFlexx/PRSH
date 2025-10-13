@@ -3,80 +3,81 @@
 **GitHub:** https://github.com/RobertFlexx  
 **Version:** BETA
 
-A tiny, friendly interactive shell written in Perl. Colorful prompt, small set of builtins, persistent history, a fallback inline editor when a full Readline backend isn't available, immediate `^C` handling, tab completion, and a couple of convenience commands.
+> A tiny, friendly interactive shell written in Perl. Colorful prompt, small set of builtins, persistent history, fallback inline editor when a full Readline backend isn't available, immediate `^C` handling, tab completion, and a couple of convenience commands.
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#overview)  
-2. [Features at a glance](#features-at-a-glance)  
-3. [Requirements & optional modules](#requirements--optional-modules)  
-4. [Installation (quick & manual)](#installation-quick--manual)  
-5. [Running the shell](#running-the-shell)  
-6. [Built-in commands (help & examples)](#built-in-commands-help--examples)  
-7. [History & config files](#history--config-files)  
-8. [Prompt, tab completion & fallback editor behavior](#prompt-tab-completion--fallback-editor-behavior)  
-9. [Ctrl-C (SIGINT) behavior — how it works](#ctrl-c-sigint-behavior---how-it-works)  
-10. [Examples and usage patterns](#examples-and-usage-patterns)  
-11. [Troubleshooting & FAQ](#troubleshooting--faq)  
-12. [Developing, updating repo & pushing to GitHub (git flow)](#developing-updating-repo--pushing-to-github-git-flow)  
-13. [Contributing guidelines](#contributing-guidelines)  
-14. [Changelog (high level)](#changelog-high-level)  
-15. [License & contact](#license--contact)
+- [Overview](#overview)  
+- [Features at a glance](#features-at-a-glance)  
+- [Requirements & optional modules](#requirements--optional-modules)  
+- [Installation (quick & manual)](#installation-quick--manual)  
+- [Running the shell](#running-the-shell)  
+- [Built-in commands (help & examples)](#built-in-commands-help--examples)  
+- [History & config files](#history--config-files)  
+- [Prompt, tab completion & fallback editor behavior](#prompt-tab-completion--fallback-editor-behavior)  
+- [Ctrl-C (SIGINT) behavior — how it works](#ctrl-c-sigint-behavior---how-it-works)  
+- [Examples and usage patterns](#examples-and-usage-patterns)  
+- [Troubleshooting & FAQ](#troubleshooting--faq)  
+- [Developing, updating repo & pushing to GitHub (git flow)](#developing-updating-repo--pushing-to-github-git-flow)  
+- [Contributing guidelines](#contributing-guidelines)  
+- [Changelog (high level)](#changelog-high-level)  
+- [License & contact](#license--contact)  
 
 ---
 
 ## Overview
 
-`prsh` is a small interactive shell with:
+`prsh` is a compact interactive shell implemented in Perl with an emphasis on pleasant interactive experience rather than full POSIX-compliance. It provides:
 
-- colorized prompt (cwd + hostname),
-- a concise set of builtins for everyday tasks,
-- persistent history (`~/.prsh_history`),
-- fallback inline editor (basic editing + history) when a full Readline backend isn't present,
-- immediate `^C` output while idle and robust forwarding of SIGINT to children,
-- tab completion for files and executables,
-- a small persistent config file (`~/.prshrc`) to toggle a welcome hint.
+- a colored prompt (cwd + hostname),
+- a concise set of builtin commands for daily use,
+- persistent history saved across sessions,
+- a fallback inline editor when a full Readline implementation is absent,
+- immediate `^C` feedback when idle while correctly forwarding `SIGINT` to child processes,
+- basic tab completion (files + PATH executables),
+- a tiny persistent config file for simple flags.
 
-It aims to be simple and pleasant for interactive use, not a full POSIX shell replacement.
+This README explains usage, installation, configuration, builtins, internals that matter to users, troubleshooting, and how to publish/update the project on GitHub.
 
 ---
 
 ## Features at a glance
 
-- Prompt: working directory + hostname + colorful arrow
-- Builtins: `cd`, `pwd`, `exit/quit`, `alias`, `unalias`, `jobs`, `systemfetch`, `uptime`, `hist`, `clearhist`, `togglehint`, `help`
-- Persistent history and optional Readline integration
-- Fallback non-blocking editor with:
-  - arrow-up/down history navigation
-  - tab completion (files + PATH executables)
-  - backspace support
-- Immediate `^C` printing while idle
-- PTY-backed external command handling when `IO::Pty` is available
+- Colored prompt with working directory and hostname.
+- Builtins: `cd`, `pwd`, `exit/quit`, `alias`, `unalias`, `jobs`, `systemfetch`, `uptime`, `hist`, `clearhist`, `togglehint`, `help`.
+- Persistent history (`~/.prsh_history`) loaded on start and saved at exit.
+- Fallback inline editor using `Term::ReadKey` when full readline backend not present:
+  - Arrow-up / arrow-down history navigation
+  - Tab completion for file paths and PATH executables
+  - Simple backspace and printable character input
+- Robust `SIGINT` handling:
+  - While a child process runs: forward interrupt to child's process group.
+  - While idle at prompt: print `^C` immediately and return to prompt (no delayed printing).
+- Optional better experience if `Term::ReadLine::Gnu`, `IO::Pty`, `Term::ReadKey` are installed.
 
 ---
 
 ## Requirements & optional modules
 
-Minimum:
+**Minimum**
 
 - Perl (5.10+ recommended)
-- Typical Unix userland
+- Typical Unix userland (`/proc` used when available)
 
-Recommended (for best experience):
+**Optional (recommended for full UX)**
 
-- `Term::ReadLine::Gnu` — for full readline editing features
-- `Term::ReadKey` — fallback editor input handling
-- `IO::Pty` — proper interactive behavior for external programs
-- (Perl's core modules used: `POSIX`, `Socket`, `File::Spec`, `Cwd`, `Sys::Hostname`, `Time::HiRes`, `Text::ParseWords`, `IO::Select`)
+- `Term::ReadLine::Gnu` — full readline editing, history support.
+- `Term::ReadKey` — required for the fallback inline editor.
+- `IO::Pty` — makes interactive children behave correctly (PTY allocation).
+- `Time::HiRes` — for accurate CPU sampling (usually core but sometimes separate).
+- `Text::ParseWords` — used for shell-like word splitting (`shellwords`).
 
-Install optional modules via your package manager or CPAN:
+**Install (Debian/Ubuntu examples)**
 
 ```bash
-# example (Debian/Ubuntu)
-sudo apt install libterm-readline-gnu-perl libterm-readkey-perl libio-pty-perl
-
-# or via cpanminus
-curl -L https://cpanmin.us | perl - App::cpanminus
-sudo cpanm Term::ReadLine::Gnu Term::ReadKey IO::Pty
+sudo apt update
+sudo apt install perl libterm-readline-gnu-perl libterm-readkey-perl libio-pty-perl
+# or via CPAN/cpanminus:
+cpanm Term::ReadLine::Gnu Term::ReadKey IO::Pty
