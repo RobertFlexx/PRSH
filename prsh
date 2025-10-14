@@ -19,12 +19,15 @@ use POSIX qw(strftime setsid dup2);
 use Term::ReadLine;
 use Socket;
 use File::Spec;
+use File::Basename;
 use Cwd ();
 use Sys::Hostname qw(hostname);
 use Time::HiRes qw(sleep);
 use Text::ParseWords;
 use Term::ReadKey;
 use IO::Select;
+use JSON::MaybeXS;
+use File::Path qw(make_path remove_tree);
 
 # ---------------- version / env ----------------
 my $PRSH_VERSION = "BETA";
@@ -32,7 +35,6 @@ $0 = "prsh-$PRSH_VERSION";
 $ENV{SHELL} = "prsh-$PRSH_VERSION";
 print "\033]0;prsh-$PRSH_VERSION\007";
 
-# ---------------- add GitHub link (as older versions had) ----------------
 my $GITHUB = "https://github.com/RobertFlexx";
 
 # ---------------- globals / history / term detection ----------------
@@ -74,11 +76,32 @@ sub write_config {
 }
 load_config();
 $config{hide_readline_hint} = 0 unless defined $config{hide_readline_hint};
+$config{confirm_exit} = 1 unless defined $config{confirm_exit};
 
 my $term = Term::ReadLine->new('prsh');
-my $OUT = $term->OUT || *STDOUT;
+my $OUT = eval { $term->OUT } || *STDOUT;
+{
+    my $oldhandle = select($OUT);
+    $| = 1;
+    select($oldhandle);
+}
+
+my $rl_backend = '';
+eval { $rl_backend = $term->ReadLine // '' };
+$rl_backend ||= ref($term) || '';
+
 my $has_addhistory = eval { $term->can('addhistory') } || 0;
 my $has_get_history = eval { $term->can('get_history') } || 0;
+
+eval {
+    if ($term && $term->can('Attribs')) {
+        my $attribs = eval { $term->Attribs };
+        if ($attribs && ref($attribs) eq 'HASH') {
+            $attribs->{catch_signals} = 0;
+            $attribs->{completion_function} = $attribs->{completion_function} if exists $attribs->{completion_function};
+        }
+    }
+};
 
 my $interrupted = 0;
 
@@ -153,12 +176,18 @@ sub nice_bar {
     return color("[$bar]", $code) . " " . color(sprintf("%3d%%", $pct), 37);
 }
 
-# ---------------- completion helpers (used by fallback editor) ----------------
+sub visible_length {
+    my ($s) = @_;
+    return 0 unless defined $s;
+    (my $t = $s) =~ s/\e\[[0-9;]*[mK]//g;
+    $t =~ s/\e\[[0-9;]*[A-Za-z]//g;
+    return length($t);
+}
+
 sub _collect_completions {
     my ($text) = @_;
     $text //= '';
     my @matches;
-
     if ($text =~ /\//) {
         my ($dir,$prefix) = $text =~ m{^(.*/)?([^/]*)$};
         $dir //= './';
@@ -184,13 +213,11 @@ sub _collect_completions {
             }
         }
     }
-
     my %seen;
     @matches = grep { !$seen{$_}++ } sort @matches;
     return @matches;
 }
 
-# ---------------- aliases ----------------
 sub expand_aliases {
     my ($cmd,$seen)=@_; $seen ||= {};
     return $cmd unless defined $cmd && $cmd =~ /\S/;
@@ -251,15 +278,151 @@ sub storage_info { my $cwd = Cwd::getcwd(); my $out = qx(df -B1 "$cwd" 2>/dev/nu
 sub which { for my $d (split /:/, $ENV{PATH}) { next unless defined $d && $d ne ''; my $f = File::Spec->catfile($d, $_[0]); return $f if -x $f } return undef }
 sub run_and_count_lines { my ($cmd)=@_; my $out = qx($cmd 2>/dev/null); return 0 unless defined $out && $out ne ''; return scalar split /\n/,$out }
 sub detect_pkg_manager_and_count {
-    if (which('dpkg-query')) { my $c=0; my $fmt="'\\\${Status} \\\${Package}\\n'"; if (open my $fh,'-|',"dpkg-query -W -f=$fmt 2>/dev/null"){ while(<$fh>){ $c++ if /^install ok installed/ } close $fh; return ('dpkg',$c,"dpkg (Debian/Ubuntu)"); } else { return ('dpkg',0,"dpkg (Debian/Ubuntu)"); } }
+    if (which('dpkg')) { my $c = run_and_count_lines("dpkg -l | grep -E '^ii\\s' || true"); return ('dpkg',$c,"dpkg (Debian/Ubuntu)"); }
     if (which('rpm')) { my $c = run_and_count_lines('rpm -qa'); return ('rpm',$c,"rpm (RHEL/Fedora/openSUSE)"); }
     if (which('pacman')) { my $c = run_and_count_lines('pacman -Q'); return ('pacman',$c,"pacman (Arch)"); }
     if (which('apk')) { my $c = run_and_count_lines('apk info'); return ('apk',$c,"apk (Alpine)"); }
-    if (which('pkg')) { my $c = run_and_count_lines('pkg info'); return ('pkg',$c,"pkg (FreeBSD)"); }
+    if (which('pkg')) { my $c = run_and_count_lines('pkg info'); return ('pkg',$c,"pkg (FreeBSD/Termux)"); }
     if (which('flatpak')) { my $c = run_and_count_lines('flatpak list --app'); return ('flatpak',$c,"flatpak (flatpak apps)"); }
     if (which('snap')) { my $c = run_and_count_lines('snap list'); return ('snap',$c,"snap (snap packages)"); }
     return ('unknown',0,"unknown");
 }
+
+# ---------------- simple prsh-local package manager ----------------
+
+my $PRSH_PKG_ROOT = File::Spec->catdir(home_dir(), ".prsh", "packages");
+my $PRSH_LOCAL_BIN = File::Spec->catdir(home_dir(), ".local", "prsh", "bin");
+make_path($PRSH_PKG_ROOT) unless -d $PRSH_PKG_ROOT;
+make_path($PRSH_LOCAL_BIN) unless -d $PRSH_LOCAL_BIN;
+$ENV{PATH} = $PRSH_LOCAL_BIN . ':' . ($ENV{PATH} // '');
+
+sub _pkg_meta_file { my ($name) = @_; return File::Spec->catfile($PRSH_PKG_ROOT,$name,"meta.json"); }
+sub _read_pkg_meta { my ($name) = @_; my $f = _pkg_meta_file($name); return {} unless -f $f; if(open my $fh,'<:encoding(UTF-8)',$f){ local $/; my $j = <$fh>; close $fh; my $h = eval { decode_json($j) }; return $h && ref($h) eq 'HASH' ? $h : {} } return {}; }
+sub _write_pkg_meta { my ($name,$meta) = @_; my $dir = File::Spec->catdir($PRSH_PKG_ROOT,$name); make_path($dir) unless -d $dir; my $f = _pkg_meta_file($name); if(open my $fh,'>:encoding(UTF-8)',$f){ print $fh encode_json($meta); close $fh; return 1 } return 0; }
+
+sub _link_package_bins { my ($name) = @_; my $pkgdir = File::Spec->catdir($PRSH_PKG_ROOT,$name); my $bindir = File::Spec->catdir($pkgdir,'bin'); return unless -d $bindir; opendir my $dh,$bindir or return; while(my $f = readdir $dh){ next if $f =~ /^\./; my $src = File::Spec->catfile($bindir,$f); my $dst = File::Spec->catfile($PRSH_LOCAL_BIN,$f); unlink $dst if -l $dst; symlink $src,$dst unless -e $dst; } closedir $dh; }
+sub _unlink_package_bins { my ($name)=@_; my $pkgdir = File::Spec->catdir($PRSH_PKG_ROOT,$name); my $bindir = File::Spec->catdir($pkgdir,'bin'); return unless -d $bindir; opendir my $dh,$bindir or return; while(my $f = readdir $dh){ next if $f =~ /^\./; my $dst = File::Spec->catfile($PRSH_LOCAL_BIN,$f); if(-l $dst){ my $target = readlink $dst; unlink $dst if defined $target && File::Spec->rel2abs($target) eq File::Spec->rel2abs(File::Spec->catfile($bindir,$f)); } } closedir $dh; }
+
+sub pkg_install_git {
+    my ($git_url) = @_;
+    return say "Usage: pkg install <git_url>" unless $git_url;
+    my ($pkgname) = $git_url =~ m{/([^/]+?)(?:\.git)?$};
+    $pkgname ||= 'pkg_' . time();
+    my $dest = File::Spec->catdir($PRSH_PKG_ROOT,$pkgname);
+    if(-d $dest){ say color(":: ",35) . color("Package '$pkgname' is already installed",33); return }
+    print color(":: ",35) . "Proceed with installation of " . color($pkgname,36) . "? [Y/n] ";
+    my $answer = <STDIN>;
+    chomp $answer if defined $answer;
+    $answer //= '';
+    if ($answer =~ /^n/i) { say color(":: ",35) . "Installation cancelled."; return; }
+    say color(":: ",35) . "Retrieving package: " . color($pkgname,36);
+    make_path($dest);
+    open my $null, '>', '/dev/null' or die;
+    my $old_stdout = select $null;
+    my $rc = system('git','clone','--depth','1','--quiet',$git_url,$dest);
+    select $old_stdout;
+    close $null;
+    if($rc != 0){ remove_tree($dest); say color("error: ",31) . "failed to retrieve package"; return }
+    say color(":: ",35) . "Installing " . color($pkgname,36) . "...";
+    my $meta = _read_pkg_meta($pkgname);
+    $meta->{name} = $pkgname;
+    $meta->{source} = $git_url;
+    $meta->{type} = 'git';
+    $meta->{enabled} = 1 unless defined $meta->{enabled};
+    _write_pkg_meta($pkgname,$meta);
+    _link_package_bins($pkgname);
+    say color(":: ",35) . color("Successfully installed ",32) . color($pkgname,36);
+}
+
+sub pkg_install_local {
+    my ($src) = @_;
+    return say "Usage: pkg install /path/to/dir" unless $src;
+    return say color("error: ",31) . "source directory not found" unless -d $src;
+    my $pkgname = basename($src);
+    my $dest = File::Spec->catdir($PRSH_PKG_ROOT,$pkgname);
+    if(-d $dest){ say color(":: ",35) . color("Package '$pkgname' is already installed",33); return }
+    print color(":: ",35) . "Proceed with installation of " . color($pkgname,36) . "? [Y/n] ";
+    my $answer = <STDIN>;
+    chomp $answer if defined $answer;
+    $answer //= '';
+    if ($answer =~ /^n/i) { say color(":: ",35) . "Installation cancelled."; return; }
+    say color(":: ",35) . "Installing local package: " . color($pkgname,36);
+    make_path($dest);
+    my $rc = system('cp','-a',"$src/.",$dest);
+    if($rc != 0){ remove_tree($dest); say color("error: ",31) . "copy operation failed"; return }
+    my $meta = _read_pkg_meta($pkgname);
+    $meta->{name} = $pkgname;
+    $meta->{source} = Cwd::getcwd() . "/$src";
+    $meta->{type} = 'local';
+    $meta->{enabled} = 1 unless defined $meta->{enabled};
+    _write_pkg_meta($pkgname,$meta);
+    _link_package_bins($pkgname);
+    say color(":: ",35) . color("Successfully installed ",32) . color($pkgname,36);
+}
+
+sub detect_system_pkg { return 'pkg' if which('pkg'); return 'apt' if which('apt-get') || which('apt'); return 'dnf' if which('dnf'); return 'pacman' if which('pacman'); return undef; }
+sub pkg_install_system { my ($name) = @_; return say "Usage: pkg install --system <name>" unless $name; my $mgr = detect_system_pkg() or return say "No system package manager detected"; my @cmd; if($mgr eq 'pkg'){ @cmd = ('sudo','pkg','install','-y',$name) } elsif($mgr eq 'apt'){ @cmd = ('sudo','apt','install','-y',$name) } elsif($mgr eq 'pacman'){ @cmd = ('sudo','pacman','-S','--noconfirm',$name) } else { return say "System manager $mgr not supported" } system(@cmd) == 0 ? say "System package installed" : say "System install failed"; }
+
+sub pkg_list { opendir my $dh,$PRSH_PKG_ROOT or return say "No packages"; while(my $d = readdir $dh){ next if $d =~ /^\./; my $meta = _read_pkg_meta($d) || {}; printf "%-20s %s %s\n", $d, ($meta->{version}//''), ($meta->{enabled} ? "[ENABLED]" : "[DISABLED]"); } closedir $dh; }
+
+sub pkg_remove {
+    my ($name)=@_;
+    return say "Usage: pkg remove <name>" unless $name;
+    my $dir = File::Spec->catdir($PRSH_PKG_ROOT,$name);
+    return say color("error: ",31) . "package '$name' is not installed" unless -d $dir;
+    print color(":: ",35) . "Proceed with removal of " . color($name,36) . "? [Y/n] ";
+    my $answer = <STDIN>;
+    chomp $answer if defined $answer;
+    $answer //= '';
+    if ($answer =~ /^n/i) { say color(":: ",35) . "Removal cancelled."; return; }
+    say color(":: ",35) . "Removing package: " . color($name,36);
+    _unlink_package_bins($name);
+    remove_tree($dir);
+    say color(":: ",35) . color("Successfully removed ",32) . color($name,36);
+}
+
+sub pkg_enable { my ($name)=@_; return say "Usage: pkg enable <name>" unless $name; my $meta = _read_pkg_meta($name); $meta->{enabled} = 1; _write_pkg_meta($name,$meta); _link_package_bins($name); say "Enabled $name"; }
+sub pkg_disable { my ($name)=@_; return say "Usage: pkg disable <name>" unless $name; my $meta = _read_pkg_meta($name); $meta->{enabled} = 0; _write_pkg_meta($name,$meta); _unlink_package_bins($name); say "Disabled $name"; }
+
+sub pkg_update {
+    my ($name)=@_;
+    if(!$name || $name eq '--all'){
+        say color(":: ",35) . "Synchronizing package databases...";
+        my $count = 0;
+        opendir my $dh,$PRSH_PKG_ROOT or return;
+        while(my $d = readdir $dh){
+            next if $d =~ /^\./;
+            my $m = _read_pkg_meta($d);
+            if($m->{type} && $m->{type} eq 'git'){
+                say color(":: ",35) . "Updating " . color($d,36) . "...";
+                my $dir = File::Spec->catdir($PRSH_PKG_ROOT,$d);
+                open my $null, '>', '/dev/null' or next;
+                my $old_stdout = select $null;
+                system('git','-C',$dir,'pull','--ff-only','--quiet');
+                select $old_stdout;
+                close $null;
+                $count++;
+            }
+        }
+        closedir $dh;
+        say color(":: ",35) . color("Updated $count package(s)",32);
+        return
+    }
+    my $meta = _read_pkg_meta($name);
+    return say color("error: ",31) . "unknown package or not a git package" unless $meta && $meta->{type} eq 'git';
+    say color(":: ",35) . "Updating " . color($name,36) . "...";
+    my $dir = File::Spec->catdir($PRSH_PKG_ROOT,$name);
+    open my $null, '>', '/dev/null' or return say color("error: ",31) . "update failed";
+    my $old_stdout = select $null;
+    my $rc = system('git','-C',$dir,'pull','--ff-only','--quiet');
+    select $old_stdout;
+    close $null;
+    if($rc == 0){ say color(":: ",35) . color("Successfully updated ",32) . color($name,36) } else { say color("error: ",31) . "update failed" }
+}
+
+sub pkg_info { my ($name)=@_; return say "Usage: pkg info <name>" unless $name; my $m = _read_pkg_meta($name); if(!$m || !%$m){ say "No metadata for $name"; return } for my $k (sort keys %$m){ printf "%-15s: %s\n", $k, $m->{$k} } }
+
+sub load_enabled_packages { opendir my $dh,$PRSH_PKG_ROOT or return; while(my $d = readdir $dh){ next if $d =~ /^\./; my $m = _read_pkg_meta($d); next unless $m->{enabled}; if($m->{entry}){ my $entry = File::Spec->catfile($PRSH_PKG_ROOT,$d,$m->{entry}); if(-f $entry){ do $entry; warn "package $d load failed: $@" if $@ } } } closedir $dh; }
 
 # ---------------- builtins ----------------
 sub builtin_help {
@@ -278,6 +441,7 @@ sub builtin_help {
     printf "%s\n", color(sprintf("%-18s", "hist"), "1;36") . "Show shell history";
     printf "%s\n", color(sprintf("%-18s", "clearhist"), "1;36") . "Clear saved history (memory + file)";
     printf "%s\n", color(sprintf("%-18s", "togglehint"), "1;36") . "Toggle persistent readline hint on/off";
+    printf "%s\n", color(sprintf("%-18s", "pkg"), "1;36") . "Package manager: install/list/remove/enable/disable/update/info";
     printf "%s\n", color(sprintf("%-18s", "help"), "1;36") . "Show this help message";
     say color('=' x 60, "1;35");
 }
@@ -328,7 +492,6 @@ sub builtin_hist {
     if (-f $HISTORY_FILE) { if (open my $hf,'<:encoding(UTF-8)',$HISTORY_FILE) { while (my $line = <$hf>) { chomp $line; printf "%5d  %s\n", ++$i, $line } close $hf; return } }
 }
 
-# ---------------- new builtin: clearhist ----------------
 sub builtin_clearhist {
     @own_history = ();
     if (-f $HISTORY_FILE) {
@@ -348,12 +511,19 @@ sub builtin_clearhist {
     say color("History cleared (memory + file).", 32);
 }
 
-# ---------------- new builtin: togglehint (persistent) ----------------
 sub builtin_togglehint {
     $config{hide_readline_hint} = $config{hide_readline_hint} ? 0 : 1;
     write_config();
     say color("Persistent readline hint is now " . ($config{hide_readline_hint} ? "OFF" : "ON") . ".", 36);
 }
+
+sub builtin_toggleconfirmexit {
+    $config{confirm_exit} = $config{confirm_exit} ? 0 : 1;
+    write_config();
+    say color("Confirm-on-exit is now " . ($config{confirm_exit} ? "ON" : "OFF") . ".", 36);
+}
+
+sub builtin_togleconfirmexit { builtin_toggleconfirmexit(); }
 
 sub builtin_uptime {
     if (-f '/proc/uptime') {
@@ -419,7 +589,8 @@ sub run_external {
         set_winsize_for_pty($pty);
         local $SIG{WINCH} = sub { set_winsize_for_pty($pty) };
         local $SIG{INT} = 'IGNORE';
-        Term::ReadKey::ReadMode('raw');
+
+        my $oldmode = Term::ReadKey::ReadMode(4);
         my $sel = IO::Select->new();
         $sel->add($pty);
         $sel->add(\*STDIN);
@@ -428,11 +599,11 @@ sub run_external {
             while ($ok) {
                 my @ready = $sel->can_read(0.25);
                 for my $fh (@ready) {
-                    if ($fh == $pty) {
+                    if (defined(fileno($fh)) && defined(eval { $pty->fileno }) && fileno($fh) == eval { $pty->fileno }) {
                         my $buf = '';
                         my $n = sysread($pty, $buf, 4096);
                         if (!defined $n || $n == 0) { $ok = 0; last }
-                        print $buf;
+                        syswrite($OUT, $buf);
                     } else {
                         my $in = '';
                         my $n = sysread(STDIN, $in, 4096);
@@ -442,7 +613,7 @@ sub run_external {
                 }
             }
         };
-        Term::ReadKey::ReadMode('restore');
+        Term::ReadKey::ReadMode($oldmode);
         waitpid($pid, 0);
         my $exit = $? >> 8;
         @child_pids = grep { $_ != $pid } @child_pids;
@@ -505,9 +676,15 @@ sub run_command {
         return;
     }
     if ($args[0] eq 'exit' || $args[0] eq 'quit') {
-        print color("Do you really wanna leave me? (y/n) ",35);
-        my $ans = <STDIN>;
-        if (defined $ans) { chomp $ans; if ($ans =~ /^(y|yes)$/i) { say color("Bye! Take care!",36); kill 'TERM', $_ for @child_pids; exit 0 } else { return } } else { exit 0 }
+        if ($config{confirm_exit}) {
+            print color("Do you really wanna leave me? (y/n) ",35);
+            my $ans = <STDIN>;
+            if (defined $ans) { chomp $ans; if ($ans =~ /^(y|yes)$/i) { say color("Bye! Take care!",36); kill 'TERM', $_ for @child_pids; exit 0 } else { return } } else { exit 0 }
+        } else {
+            say color("Bye! Take care!",36);
+            kill 'TERM', $_ for @child_pids;
+            exit 0;
+        }
     }
     if ($args[0] eq 'alias') {
         if (!defined $args[1]) { while (my ($k,$v) = each %aliases) { say "$k='$v'" } }
@@ -522,20 +699,45 @@ sub run_command {
     if ($args[0] eq 'hist') { builtin_hist(); return }
     if ($args[0] eq 'clearhist') { builtin_clearhist(); return }
     if ($args[0] eq 'togglehint') { builtin_togglehint(); return }
+    if ($args[0] eq 'toggleconfirmexit') { builtin_toggleconfirmexit(); return }
+    if ($args[0] eq 'togleconfirmexit') { builtin_toggleconfirmexit(); return }
     if ($args[0] eq 'uptime') { builtin_uptime(); return }
+
+    if ($args[0] eq 'pkg') {
+        my $sub = $args[1] // '';
+        if ($sub eq 'install') {
+            if (defined $args[2] && $args[2] eq '--system') { pkg_install_system($args[3]); return }
+            my $src = $args[2];
+            unless ($src) { say color("Usage: pkg install [--system] <git_url|local_dir>",31); return }
+            if ($src =~ m{^(?:https?://|git://)|\.git$|^git@}) { pkg_install_git($src); return }
+            if (-d $src) { pkg_install_local($src); return }
+            say color("Unknown install source. Use a git URL or a local directory, or use --system for system packages.",31);
+            return;
+        } elsif ($sub eq 'list') { pkg_list(); return }
+        elsif ($sub eq 'remove') { pkg_remove($args[2]); return }
+        elsif ($sub eq 'enable') { pkg_enable($args[2]); return }
+        elsif ($sub eq 'disable') { pkg_disable($args[2]); return }
+        elsif ($sub eq 'update') { pkg_update($args[2] // '--all'); return }
+        elsif ($sub eq 'info') { pkg_info($args[2]); return }
+        else { say color("pkg subcommands: install/list/remove/enable/disable/update/info",33); return }
+    }
+
+    if (scalar(@args) == 1 && -d $args[0]) {
+        chdir $args[0] or say color("cd: $!",31);
+        return;
+    }
+
     if ($args[0] =~ m{[/\\]} || $args[0] =~ /^\./) { if (-d $args[0]) { say color("prsh: $args[0]: is a directory",31); return } }
 
     run_external($core,$stdin,$stdout,$append);
 }
 
-# ---------------- chained commands ----------------
 sub run_input_line {
     my ($input) = @_;
     my @parts = split /(?:&&|;)/, $input;
     for my $p (@parts) { $p =~ s/^\s+|\s+$//g; next unless $p; run_command($p) }
 }
 
-# ---------------- prompt & readline helpers ----------------
 my $hostname = hostname();
 my $prompt_color = random_color();
 sub prompt { my $cwd = Cwd::getcwd(); return color($cwd,33) . " " . color($hostname,36) . color(' > ', $prompt_color) }
@@ -550,124 +752,6 @@ sub running_under_rlwrap {
     return 0;
 }
 
-# ---------------- fallback readline ----------------
-sub my_readline {
-    my ($prompt_text) = @_;
-    my $under_rlwrap = running_under_rlwrap();
-
-    if (( $term && $term->can('readline') && ! (ref($term) =~ /Stub/) ) || $under_rlwrap) {
-        my $line;
-        eval {
-            local $SIG{INT} = sub { print "^C\n"; die "INT\n" };
-            $line = $term->readline($prompt_text);
-        };
-        if ($@) { return '' }
-        return $line;
-    }
-
-    print $prompt_text;
-    Term::ReadKey::ReadMode('cbreak');
-    my $line = "";
-    my $hist_index = scalar(@own_history);
-    my $redraw = sub { print "\r$prompt_text$line\x1b[K" };
-
-    my $sel = IO::Select->new();
-    $sel->add(\*STDIN);
-
-    while (1) {
-        if ($interrupted) {
-            $interrupted = 0;
-            Term::ReadKey::ReadMode('normal');
-            print "^C\n";
-            return '';
-        }
-
-        my @ready = $sel->can_read(0.08);
-        unless (@ready) { next }
-
-        my $key = ReadKey(-1);
-        defined $key or next;
-
-        if ($key eq "\x03") {
-            Term::ReadKey::ReadMode('normal');
-            print "^C\n";
-            return '';
-        }
-
-        if ($key eq "\t") {
-            my ($pre, $word) = ('', $line);
-            if ($line =~ /^(.*\s)(\S*)$/s) { $pre = $1; $word = $2; }
-            my @matches = _collect_completions($word);
-            if (!@matches) {
-            } elsif (@matches == 1) {
-                my $m = $matches[0];
-                my $suffix = substr($m, length($word));
-                if (-d $m && $m !~ m{/$}) { $suffix .= '/' unless $suffix =~ m{/$} }
-                $line = $pre . $word . $suffix;
-                if (!(-d $m)) { $line .= ' ' unless $line =~ /\s$/ }
-                $redraw->();
-            } else {
-                Term::ReadKey::ReadMode('normal');
-                print "\n";
-                for my $m (@matches) { print "$m\n" }
-                print "\n";
-                $redraw->();
-                Term::ReadKey::ReadMode('cbreak');
-            }
-            next;
-        }
-
-        if ($key eq "\n" || $key eq "\r") {
-            print "\n";
-            last;
-        }
-
-        if ($key eq "\x7f" || $key eq "\x08") {
-            if (length $line) {
-                substr($line, -1, 1, '');
-                $redraw->();
-            }
-            next;
-        }
-
-        if ($key eq "\e") {
-            my $b = ReadKey(-1);
-            if (defined $b && $b eq '[') {
-                my $c = ReadKey(-1);
-                if (defined $c) {
-                    if ($c eq 'A') {
-                        if ($hist_index > 0) {
-                            $hist_index--;
-                            $line = $own_history[$hist_index] // '';
-                            $redraw->();
-                        }
-                    } elsif ($c eq 'B') {
-                        if ($hist_index < @own_history - 1) {
-                            $hist_index++;
-                            $line = $own_history[$hist_index] // '';
-                        } else {
-                            $hist_index = @own_history;
-                            $line = '';
-                        }
-                        $redraw->();
-                    }
-                }
-            }
-            next;
-        }
-
-        if ($key =~ /^[\x20-\x7e]$/) {
-            $line .= $key;
-            print $key;
-            next;
-        }
-    }
-
-    Term::ReadKey::ReadMode('normal');
-    return $line;
-}
-
-# ---------------- completion (readline) ----------------
 if ($term->can('Attribs')) {
     my $attribs = $term->Attribs;
     eval {
@@ -682,7 +766,6 @@ if ($term->can('Attribs')) {
     };
 }
 
-# ---------------- welcome ----------------
 sub print_welcome {
     say color("Welcome to prsh $PRSH_VERSION - your Perl-ish shell!",36);
     say color("Current Time:",36) . " " . color(current_time(),34);
@@ -702,12 +785,13 @@ sub print_welcome {
     say color("GitHub: $GITHUB",90);
     say "";
 }
+
+load_enabled_packages();
 print_welcome();
 
-# ---------------- main loop ----------------
 while (1) {
     print "\033]0;prsh-$PRSH_VERSION\007";
-    my $line = my_readline(prompt());
+    my $line = $term->readline(prompt());
     unless (defined $line) { say ""; last }
     $line =~ s/^\s+|\s+$//g;
     next if $line eq '';
