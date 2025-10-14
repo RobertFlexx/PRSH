@@ -36,7 +36,7 @@ This README documents everything users and contributors need to know.
 - Robust `SIGINT` handling:
   - Forwards `SIGINT` to children when they are running
   - Prints `^C` immediately when idle (no delayed printing)
-- Optional improvements when modules installed: `Term::ReadLine::Gnu`, `IO::Pty`, `Term::ReadKey`
+- Optional improvements when modules installed: `Term::ReadLine::Gnu (SEVERELY bugged)`, `IO::Pty`, `Term::ReadKey (necessary)`
 
 ---
 
