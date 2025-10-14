@@ -19,6 +19,7 @@ use POSIX qw(strftime setsid dup2);
 use Term::ReadLine;
 use Socket;
 use File::Spec;
+use File::Basename;
 use Cwd ();
 use Sys::Hostname qw(hostname);
 use Time::HiRes qw(sleep);
@@ -40,7 +41,7 @@ sub home_dir {
     return $ENV{HOME} if defined $ENV{HOME} && $ENV{HOME} ne '';
     my $home = (getpwuid($<))[7];
     return $home if defined $home && $home ne '';
-    return '.';
+    return '.'."";
 }
 my $HISTORY_FILE = File::Spec->catfile(home_dir(), ".prsh_history");
 my $CONFIG_FILE  = File::Spec->catfile(home_dir(), ".prshrc");
@@ -74,11 +75,38 @@ sub write_config {
 }
 load_config();
 $config{hide_readline_hint} = 0 unless defined $config{hide_readline_hint};
+$config{confirm_exit} = 1 unless defined $config{confirm_exit};
 
 my $term = Term::ReadLine->new('prsh');
-my $OUT = $term->OUT || *STDOUT;
+
+# prefer using the term->OUT handle (some backends provide a separate output filehandle)
+my $OUT = eval { $term->OUT } || *STDOUT;
+# ensure autoflush on chosen OUT
+{
+    my $oldhandle = select($OUT);
+    $| = 1;
+    select($oldhandle);
+}
+
+# detect backend name (safe eval)
+my $rl_backend = '';
+eval { $rl_backend = $term->ReadLine // '' };
+$rl_backend ||= ref($term) || '';
+
 my $has_addhistory = eval { $term->can('addhistory') } || 0;
 my $has_get_history = eval { $term->can('get_history') } || 0;
+
+# If a real Attribs hash exists, try to disable ReadLine catching signals globally.
+eval {
+    if ($term && $term->can('Attribs')) {
+        my $attribs = eval { $term->Attribs };
+        if ($attribs && ref($attribs) eq 'HASH') {
+            $attribs->{catch_signals} = 0;
+            # make completion safe: don't overwrite user's PATH completion code
+            $attribs->{completion_function} = $attribs->{completion_function} if exists $attribs->{completion_function};
+        }
+    }
+};
 
 my $interrupted = 0;
 
@@ -153,12 +181,18 @@ sub nice_bar {
     return color("[$bar]", $code) . " " . color(sprintf("%3d%%", $pct), 37);
 }
 
-# ---------------- completion helpers (used by fallback editor) ----------------
+sub visible_length {
+    my ($s) = @_;
+    return 0 unless defined $s;
+    (my $t = $s) =~ s/\e\[[0-9;]*[mK]//g;
+    $t =~ s/\e\[[0-9;]*[A-Za-z]//g;
+    return length($t);
+}
+
 sub _collect_completions {
     my ($text) = @_;
     $text //= '';
     my @matches;
-
     if ($text =~ /\//) {
         my ($dir,$prefix) = $text =~ m{^(.*/)?([^/]*)$};
         $dir //= './';
@@ -184,13 +218,11 @@ sub _collect_completions {
             }
         }
     }
-
     my %seen;
     @matches = grep { !$seen{$_}++ } sort @matches;
     return @matches;
 }
 
-# ---------------- aliases ----------------
 sub expand_aliases {
     my ($cmd,$seen)=@_; $seen ||= {};
     return $cmd unless defined $cmd && $cmd =~ /\S/;
@@ -251,7 +283,7 @@ sub storage_info { my $cwd = Cwd::getcwd(); my $out = qx(df -B1 "$cwd" 2>/dev/nu
 sub which { for my $d (split /:/, $ENV{PATH}) { next unless defined $d && $d ne ''; my $f = File::Spec->catfile($d, $_[0]); return $f if -x $f } return undef }
 sub run_and_count_lines { my ($cmd)=@_; my $out = qx($cmd 2>/dev/null); return 0 unless defined $out && $out ne ''; return scalar split /\n/,$out }
 sub detect_pkg_manager_and_count {
-    if (which('dpkg-query')) { my $c=0; my $fmt="'\\\${Status} \\\${Package}\\n'"; if (open my $fh,'-|',"dpkg-query -W -f=$fmt 2>/dev/null"){ while(<$fh>){ $c++ if /^install ok installed/ } close $fh; return ('dpkg',$c,"dpkg (Debian/Ubuntu)"); } else { return ('dpkg',0,"dpkg (Debian/Ubuntu)"); } }
+    if (which('dpkg')) { my $c = run_and_count_lines("dpkg -l | grep -E '^ii\\s' || true"); return ('dpkg',$c,"dpkg (Debian/Ubuntu)"); }
     if (which('rpm')) { my $c = run_and_count_lines('rpm -qa'); return ('rpm',$c,"rpm (RHEL/Fedora/openSUSE)"); }
     if (which('pacman')) { my $c = run_and_count_lines('pacman -Q'); return ('pacman',$c,"pacman (Arch)"); }
     if (which('apk')) { my $c = run_and_count_lines('apk info'); return ('apk',$c,"apk (Alpine)"); }
@@ -277,7 +309,10 @@ sub builtin_help {
     printf "%s\n", color(sprintf("%-18s", "uptime"), "1;36") . "Show system uptime";
     printf "%s\n", color(sprintf("%-18s", "hist"), "1;36") . "Show shell history";
     printf "%s\n", color(sprintf("%-18s", "clearhist"), "1;36") . "Clear saved history (memory + file)";
-    printf "%s\n", color(sprintf("%-18s", "togglehint"), "1;36") . "Toggle persistent readline hint on/off";
+    printf "%s
+", color(sprintf("%-18s", "togglehint"), "1;36") . "Toggle persistent readline hint on/off";
+    printf "%s
+", color(sprintf("%-18s", "toggleconfirmexit"), "1;36") . "Toggle confirm-on-exit prompt on/off";
     printf "%s\n", color(sprintf("%-18s", "help"), "1;36") . "Show this help message";
     say color('=' x 60, "1;35");
 }
@@ -310,6 +345,7 @@ sub builtin_systemfetch {
     say color('=' x 60, "1;35");
 }
 
+# ---------------- new builtin: clearhist ----------------
 sub builtin_jobs {
     if (!@child_pids) { say color("No tracked child jobs.", 36); return; }
     for my $pgid (@child_pids) {
@@ -328,7 +364,6 @@ sub builtin_hist {
     if (-f $HISTORY_FILE) { if (open my $hf,'<:encoding(UTF-8)',$HISTORY_FILE) { while (my $line = <$hf>) { chomp $line; printf "%5d  %s\n", ++$i, $line } close $hf; return } }
 }
 
-# ---------------- new builtin: clearhist ----------------
 sub builtin_clearhist {
     @own_history = ();
     if (-f $HISTORY_FILE) {
@@ -354,6 +389,15 @@ sub builtin_togglehint {
     write_config();
     say color("Persistent readline hint is now " . ($config{hide_readline_hint} ? "OFF" : "ON") . ".", 36);
 }
+
+sub builtin_toggleconfirmexit {
+    $config{confirm_exit} = $config{confirm_exit} ? 0 : 1;
+    write_config();
+    say color("Confirm-on-exit is now " . ($config{confirm_exit} ? "ON" : "OFF") . ".", 36);
+}
+
+# backward-compatible alias (common typo)
+sub builtin_togleconfirmexit { builtin_toggleconfirmexit(); }
 
 sub builtin_uptime {
     if (-f '/proc/uptime') {
@@ -419,7 +463,8 @@ sub run_external {
         set_winsize_for_pty($pty);
         local $SIG{WINCH} = sub { set_winsize_for_pty($pty) };
         local $SIG{INT} = 'IGNORE';
-        Term::ReadKey::ReadMode('raw');
+
+        my $oldmode = Term::ReadKey::ReadMode(4);  # raw, no echo
         my $sel = IO::Select->new();
         $sel->add($pty);
         $sel->add(\*STDIN);
@@ -428,11 +473,12 @@ sub run_external {
             while ($ok) {
                 my @ready = $sel->can_read(0.25);
                 for my $fh (@ready) {
-                    if ($fh == $pty) {
+                    if (defined(fileno($fh)) && defined(eval { $pty->fileno }) && fileno($fh) == eval { $pty->fileno }) {
                         my $buf = '';
                         my $n = sysread($pty, $buf, 4096);
                         if (!defined $n || $n == 0) { $ok = 0; last }
-                        print $buf;
+                        # write to the chosen OUT to keep console consistent
+                        syswrite($OUT, $buf);
                     } else {
                         my $in = '';
                         my $n = sysread(STDIN, $in, 4096);
@@ -442,7 +488,7 @@ sub run_external {
                 }
             }
         };
-        Term::ReadKey::ReadMode('restore');
+        Term::ReadKey::ReadMode($oldmode);
         waitpid($pid, 0);
         my $exit = $? >> 8;
         @child_pids = grep { $_ != $pid } @child_pids;
@@ -505,9 +551,15 @@ sub run_command {
         return;
     }
     if ($args[0] eq 'exit' || $args[0] eq 'quit') {
-        print color("Do you really wanna leave me? (y/n) ",35);
-        my $ans = <STDIN>;
-        if (defined $ans) { chomp $ans; if ($ans =~ /^(y|yes)$/i) { say color("Bye! Take care!",36); kill 'TERM', $_ for @child_pids; exit 0 } else { return } } else { exit 0 }
+        if ($config{confirm_exit}) {
+            print color("Do you really wanna leave me? (y/n) ",35);
+            my $ans = <STDIN>;
+            if (defined $ans) { chomp $ans; if ($ans =~ /^(y|yes)$/i) { say color("Bye! Take care!",36); kill 'TERM', $_ for @child_pids; exit 0 } else { return } } else { exit 0 }
+        } else {
+            say color("Bye! Take care!",36);
+            kill 'TERM', $_ for @child_pids;
+            exit 0;
+        }
     }
     if ($args[0] eq 'alias') {
         if (!defined $args[1]) { while (my ($k,$v) = each %aliases) { say "$k='$v'" } }
@@ -522,7 +574,16 @@ sub run_command {
     if ($args[0] eq 'hist') { builtin_hist(); return }
     if ($args[0] eq 'clearhist') { builtin_clearhist(); return }
     if ($args[0] eq 'togglehint') { builtin_togglehint(); return }
+    if ($args[0] eq 'toggleconfirmexit') { builtin_toggleconfirmexit(); return }
+    if ($args[0] eq 'togleconfirmexit') { builtin_toggleconfirmexit(); return }
     if ($args[0] eq 'uptime') { builtin_uptime(); return }
+
+    # --- AUTOCD: if the user typed a single token which is a directory, cd into it (like your Ruby shell)
+    if (scalar(@args) == 1 && -d $args[0]) {
+        chdir $args[0] or say color("cd: $!",31);
+        return;
+    }
+
     if ($args[0] =~ m{[/\\]} || $args[0] =~ /^\./) { if (-d $args[0]) { say color("prsh: $args[0]: is a directory",31); return } }
 
     run_external($core,$stdin,$stdout,$append);
@@ -550,120 +611,303 @@ sub running_under_rlwrap {
     return 0;
 }
 
-# ---------------- fallback readline ----------------
+# ---------------- improved my_readline (readline + robust fallback) ----------------
 sub my_readline {
     my ($prompt_text) = @_;
+    $prompt_text //= '';
     my $under_rlwrap = running_under_rlwrap();
 
-    if (( $term && $term->can('readline') && ! (ref($term) =~ /Stub/) ) || $under_rlwrap) {
+    # Prefer real Term::ReadLine if available (and not the minimal Stub)
+    my $have_readline_backend = ($term && $term->can('readline'));
+    my $is_stub_backend = ($rl_backend =~ /stub/i || $rl_backend =~ /Perl::Stub/i || $rl_backend =~ /Term::ReadLine::Stub/i);
+
+    if ($have_readline_backend && (!$is_stub_backend || $under_rlwrap)) {
+        # Ensure ReadLine backend won't capture SIGINT (some backends do).
+        my $attribs = eval { $term->Attribs };
+        if ($attribs && ref($attribs) eq 'HASH') {
+            $attribs->{catch_signals} = 0;
+        }
+
         my $line;
         eval {
-            local $SIG{INT} = sub { print "^C\n"; die "INT\n" };
+            local $SIG{INT} = sub { die "INT\n" };   # intercept Ctrl-C during readline
             $line = $term->readline($prompt_text);
         };
-        if ($@) { return '' }
+        if ($@) {
+            if ($@ =~ /INT/) {
+                print $OUT "^C\n";
+                return '';
+            }
+            return undef;
+        }
         return $line;
     }
 
-    print $prompt_text;
-    Term::ReadKey::ReadMode('cbreak');
+    # ---------- Fallback editor (no ReadLine) ----------
+    # compute initial terminal size
+    my ($rows, $cols) = Term::ReadKey::GetTerminalSize();
+    $cols ||= 80;
+
+    # compute prompt (keep full cwd visible)
+    my $prompt_vis = visible_length($prompt_text);
+    my $display_prompt = $prompt_text;
+    # If you *do* want automatic shortening, change the `0` below back to `int($cols * 0.5)`
+    if (0 && $prompt_vis > int($cols * 0.5)) {
+        my $base = basename(Cwd::getcwd() // '');
+        $display_prompt = color($base,33) . " " . color($hostname,36) . color(' > ', $prompt_color);
+        $prompt_vis = visible_length($display_prompt);
+    }
+
+    # available columns for input after prompt
+    my $available = $cols - $prompt_vis;
+    $available = 10 if $available < 10;    # ensure a minimum editing area
+
+    # track horizontal scroll offset and cursor position
+    my $offset = 0;
     my $line = "";
+    my $pos = 0;
     my $hist_index = scalar(@own_history);
-    my $redraw = sub { print "\r$prompt_text$line\x1b[K" };
+
+    # helper to compute offset such that end-of-line (pos) is visible if possible
+    my $ensure_offset_for_pos = sub {
+        my ($p) = @_;
+        $p = $pos unless defined $p;
+        my $len = length($line);
+
+        # recompute available from current terminal (in case it changed externally)
+        my ($r,$c) = Term::ReadKey::GetTerminalSize();
+        $cols = $c || $cols;
+        $prompt_vis = visible_length($display_prompt);
+        $available = $cols - $prompt_vis;
+        $available = 10 if $available < 10;
+
+        # if the whole line fits, reset offset to 0 (no scrolling)
+        if ($len <= $available) {
+            $offset = 0;
+            return;
+        }
+
+        # last visible index in zero-based coordinates
+        my $last_index_visible = $available - 1;
+        # if cursor/p (or desired end) is past visible area, move offset so that p becomes visible at the right edge
+        if ($p - $offset > $last_index_visible) {
+            $offset = $p - $last_index_visible;
+        }
+        # clamp offset so we never show past end-of-line
+        if ($offset > $len - $available) {
+            $offset = $len - $available;
+        }
+        $offset = 0 if $offset < 0;
+        # if cursor is left of offset, move offset left
+        if ($p < $offset) {
+            $offset = $p;
+        }
+    };
+
+    # redraw sub (declared before SIGWINCH so the handler can call it)
+    my $redraw = sub {
+        $line //= '';
+        my $len = length($line);
+
+        # clamp offset & recompute available (safe-guards)
+        $offset = 0 if $offset < 0;
+        $offset = 0 if $len == 0;
+        if ($offset > $len) { $offset = $len > 0 ? $len - 1 : 0 }
+
+        # slice visible part of line
+        my $visible = $len ? substr($line, $offset, $available) : '';
+        $visible = '' unless defined $visible;
+
+        # left ellipsis: replace first char safely
+        if ($offset > 0) {
+            if (length($visible) >= 1) {
+                substr($visible, 0, 1, "…");
+            } else {
+                $visible = "…";
+            }
+        }
+        # right ellipsis: replace last char safely
+        if ($offset + $available < $len) {
+            if (length($visible) >= 1) {
+                substr($visible, -1, 1, "…");
+            } else {
+                $visible = "…";
+            }
+        }
+
+        # position cursor relative to displayed slice
+        my $cursor_in_visible = $pos - $offset;
+        $cursor_in_visible = 0 if $cursor_in_visible < 0;
+        $cursor_in_visible = length($visible) if $cursor_in_visible > length($visible);
+
+        # draw using the chosen OUT handle
+        print $OUT "\e[?7l";            # disable automatic wrapping
+        print $OUT "\r\e[0J";          # go to start and clear to end of screen
+        print $OUT $display_prompt;
+        print $OUT $visible;
+        print $OUT "\r";
+        my $cursor_col = $prompt_vis + $cursor_in_visible;
+        if ($cursor_col > 0) { print $OUT "\e[${cursor_col}C" }
+        print $OUT "\e[?7h";            # re-enable automatic wrapping
+    };
+
+    # update terminal size on resize and keep cursor visible
+    local $SIG{WINCH} = sub {
+        my ($r,$c) = Term::ReadKey::GetTerminalSize();
+        $cols = $c || $cols;
+        # keep full cwd visible on resize
+        # If you want shrinking behavior, change the `0` in the other block above.
+        $available = $cols - $prompt_vis;
+        $available = 10 if $available < 10;
+        # ensure offset keeps cursor visible (start scrolling only when line actually longer)
+        $ensure_offset_for_pos->($pos);
+        $redraw->();
+    };
+
+    # local interrupt handler
+    local $SIG{INT} = sub { $interrupted = 1 };
+
+    # print prompt and enter cbreak mode
+    print $OUT $display_prompt;
+    Term::ReadKey::ReadMode('cbreak');
 
     my $sel = IO::Select->new();
     $sel->add(\*STDIN);
 
-    while (1) {
-        if ($interrupted) {
-            $interrupted = 0;
-            Term::ReadKey::ReadMode('normal');
-            print "^C\n";
-            return '';
-        }
-
-        my @ready = $sel->can_read(0.08);
-        unless (@ready) { next }
-
-        my $key = ReadKey(-1);
-        defined $key or next;
-
-        if ($key eq "\x03") {
-            Term::ReadKey::ReadMode('normal');
-            print "^C\n";
-            return '';
-        }
-
-        if ($key eq "\t") {
-            my ($pre, $word) = ('', $line);
-            if ($line =~ /^(.*\s)(\S*)$/s) { $pre = $1; $word = $2; }
-            my @matches = _collect_completions($word);
-            if (!@matches) {
-            } elsif (@matches == 1) {
-                my $m = $matches[0];
-                my $suffix = substr($m, length($word));
-                if (-d $m && $m !~ m{/$}) { $suffix .= '/' unless $suffix =~ m{/$} }
-                $line = $pre . $word . $suffix;
-                if (!(-d $m)) { $line .= ' ' unless $line =~ /\s$/ }
-                $redraw->();
-            } else {
+    eval {
+        while (1) {
+            if ($interrupted) {
+                $interrupted = 0;
                 Term::ReadKey::ReadMode('normal');
-                print "\n";
-                for my $m (@matches) { print "$m\n" }
-                print "\n";
-                $redraw->();
-                Term::ReadKey::ReadMode('cbreak');
+                print $OUT "^C\n";
+                return '';
             }
-            next;
-        }
 
-        if ($key eq "\n" || $key eq "\r") {
-            print "\n";
-            last;
-        }
+            my @ready = $sel->can_read(0.08);
+            unless (@ready) { next }
 
-        if ($key eq "\x7f" || $key eq "\x08") {
-            if (length $line) {
-                substr($line, -1, 1, '');
-                $redraw->();
+            my $key = ReadKey(-1);
+            defined $key or next;
+
+            # Tab completion
+            if ($key eq "\t") {
+                my ($pre, $word) = ('', $line);
+                if ($line =~ /^(.*\s)(\S*)$/s) { $pre = $1; $word = $2; }
+                my @matches = _collect_completions($word);
+                if (!@matches) {
+                    # nothing
+                } elsif (@matches == 1) {
+                    my $m = $matches[0];
+                    my $suffix = substr($m, length($word));
+                    if (-d $m && $m !~ m{/\$}) { $suffix .= '/' unless $suffix =~ m{/\$} }
+                    my $new = $pre . $word . $suffix;
+                    if (!(-d $m)) { $new .= ' ' unless $new =~ /\s$/ }
+                    $line = $new;
+                    $pos = length($line);
+                    # ensure end-of-line visible only if line longer than available
+                    $ensure_offset_for_pos->($pos);
+                    $redraw->();
+                } else {
+                    Term::ReadKey::ReadMode('normal');
+                    print $OUT "\n";
+                    for my $m (@matches) { print $OUT "$m\n" }
+                    print $OUT "\n";
+                    ($rows, $cols) = Term::ReadKey::GetTerminalSize();
+                    $cols ||= 80;
+                    $prompt_vis = visible_length($display_prompt);
+                    $available = $cols - $prompt_vis;
+                    $available = 10 if $available < 10;
+                    Term::ReadKey::ReadMode('cbreak');
+                    $redraw->();
+                }
+                next;
             }
-            next;
-        }
 
-        if ($key eq "\e") {
-            my $b = ReadKey(-1);
-            if (defined $b && $b eq '[') {
-                my $c = ReadKey(-1);
-                if (defined $c) {
-                    if ($c eq 'A') {
-                        if ($hist_index > 0) {
-                            $hist_index--;
-                            $line = $own_history[$hist_index] // '';
+            # Enter
+            if ($key eq "\n" || $key eq "\r") {
+                print $OUT "\n";
+                last;
+            }
+
+            # Backspace / Delete
+            if ($key eq "\x7f" || $key eq "\x08") {
+                if ($pos > 0) {
+                    substr($line, $pos-1, 1, '');
+                    $pos--;
+                    # keep offset/clamp after editing
+                    $ensure_offset_for_pos->($pos);
+                    $redraw->();
+                }
+                next;
+            }
+
+            # Escape sequences (arrows, delete, etc.)
+            if ($key eq "\e") {
+                my $b = ReadKey(-1);
+                if (defined $b && $b eq '[') {
+                    my $c = ReadKey(-1);
+                    if (defined $c) {
+                        if ($c eq 'A') { # up
+                            if ($hist_index > 0) {
+                                $hist_index--;
+                                $line = $own_history[$hist_index] // '';
+                                $pos = length($line);
+                                # ensure end-of-line visible for history entries (only if line longer than available)
+                                $ensure_offset_for_pos->($pos);
+                                $redraw->();
+                            }
+                        } elsif ($c eq 'B') { # down
+                            if ($hist_index < @own_history - 1) {
+                                $hist_index++;
+                                $line = $own_history[$hist_index] // '';
+                                $pos = length($line);
+                                $ensure_offset_for_pos->($pos);
+                            } else {
+                                $hist_index = @own_history;
+                                $line = '';
+                                $pos = 0;
+                                $offset = 0;
+                            }
                             $redraw->();
-                        }
-                    } elsif ($c eq 'B') {
-                        if ($hist_index < @own_history - 1) {
-                            $hist_index++;
-                            $line = $own_history[$hist_index] // '';
+                        } elsif ($c eq 'C') { # right
+                            if ($pos < length($line)) { $pos++ }
+                            $ensure_offset_for_pos->($pos);
+                            $redraw->();
+                        } elsif ($c eq 'D') { # left
+                            if ($pos > 0) { $pos-- }
+                            if ($pos < $offset) { $offset = $pos }
+                            $redraw->();
                         } else {
-                            $hist_index = @own_history;
-                            $line = '';
+                            if ($c eq '3') {
+                                my $t = ReadKey(-1);
+                                if (defined $t && $t eq '~') {
+                                    if ($pos < length($line)) {
+                                        substr($line, $pos, 1, '');
+                                        $redraw->();
+                                    }
+                                }
+                            }
                         }
-                        $redraw->();
                     }
                 }
+                next;
             }
-            next;
-        }
 
-        if ($key =~ /^[\x20-\x7e]$/) {
-            $line .= $key;
-            print $key;
-            next;
-        }
-    }
+            # Printable characters
+            if ($key =~ /^[\x20-\x7e]$/) {
+                substr($line, $pos, 0, $key);
+                $pos++;
+                # ensure end-of-line visible only if line longer than available
+                $ensure_offset_for_pos->($pos);
+                $redraw->();
+                next;
+            }
 
+            # ignore other controls
+        }
+    };
     Term::ReadKey::ReadMode('normal');
+
     return $line;
 }
 
@@ -717,3 +961,5 @@ while (1) {
 }
 
 exit 0;
+    printf "%s
+", color(sprintf("%-18s", "toggleconfirmexit"), "1;36") . "Toggle confirm-on-exit prompt (ON/OFF)";
