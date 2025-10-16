@@ -1,5 +1,5 @@
 
-## Warning! (There is many bugs, as this is in beta stage. i STRONGLY disregard as using this as your main shell until it matures, or moves out of beta stage.)
+## Warning! (There are many bugs, as this is in beta stage. i STRONGLY disregard as using this as your main shell until it matures, or moves out of beta stage.)
 
 # prsh — Perl-ish Shell — Complete README (Full Details)
 
